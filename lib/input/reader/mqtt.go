@@ -44,12 +44,12 @@ func NewMQTTConfig() MQTTConfig {
 
 // MQTT is an input type that reads MQTT Pub/Sub messages.
 type MQTT struct {
-	client mqtt.Client
-	cMut   sync.Mutex
+	client  mqtt.Client
+	msgChan chan mqtt.Message
+	cMut    sync.Mutex
 
 	conf MQTTConfig
 
-	msgChan       chan mqtt.Message
 	interruptChan chan struct{}
 
 	urls []string
@@ -64,7 +64,6 @@ func NewMQTT(
 ) (*MQTT, error) {
 	m := &MQTT{
 		conf:          conf,
-		msgChan:       make(chan mqtt.Message),
 		interruptChan: make(chan struct{}),
 		stats:         stats,
 		log:           log,
@@ -97,13 +96,25 @@ func (m *MQTT) ConnectWithContext(ctx context.Context) error {
 		return nil
 	}
 
+	msgChan := make(chan mqtt.Message)
+
 	conf := mqtt.NewClientOptions().
-		SetAutoReconnect(true).
+		SetAutoReconnect(false).
 		SetClientID(m.conf.ClientID).
 		SetCleanSession(m.conf.CleanSession).
+		SetConnectionLostHandler(func(client mqtt.Client, reason error) {
+			client.Disconnect(0)
+			close(msgChan)
+			m.log.Errorf("Connection lost due to: %v\n", reason)
+		}).
 		SetOnConnectHandler(func(c mqtt.Client) {
 			for _, topic := range m.conf.Topics {
-				tok := c.Subscribe(topic, byte(m.conf.QoS), m.msgHandler)
+				tok := c.Subscribe(topic, byte(m.conf.QoS), func(c mqtt.Client, msg mqtt.Message) {
+					select {
+					case msgChan <- msg:
+					case <-m.interruptChan:
+					}
+				})
 				tok.Wait()
 				if err := tok.Error(); err != nil {
 					m.log.Errorf("Failed to subscribe to topic '%v': %v\n", topic, err)
@@ -131,21 +142,33 @@ func (m *MQTT) ConnectWithContext(ctx context.Context) error {
 		return err
 	}
 
-	m.client = client
-	return nil
-}
+	m.log.Infof("Receiving MQTT messages from topics: %v\n", m.conf.Topics)
 
-func (m *MQTT) msgHandler(c mqtt.Client, msg mqtt.Message) {
-	select {
-	case m.msgChan <- msg:
-	case <-m.interruptChan:
-	}
+	m.client = client
+	m.msgChan = msgChan
+	return nil
 }
 
 // ReadWithContext attempts to read a new message from an MQTT broker.
 func (m *MQTT) ReadWithContext(ctx context.Context) (types.Message, AsyncAckFn, error) {
+	m.cMut.Lock()
+	msgChan := m.msgChan
+	m.cMut.Unlock()
+
+	if msgChan == nil {
+		return nil, nil, types.ErrNotConnected
+	}
+
 	select {
-	case msg := <-m.msgChan:
+	case msg, open := <-msgChan:
+		if !open {
+			m.cMut.Lock()
+			m.msgChan = nil
+			m.client = nil
+			m.cMut.Unlock()
+			return nil, nil, types.ErrNotConnected
+		}
+
 		message := message.New([][]byte{[]byte(msg.Payload())})
 
 		meta := message.Get(0).Metadata()
@@ -155,7 +178,12 @@ func (m *MQTT) ReadWithContext(ctx context.Context) (types.Message, AsyncAckFn, 
 		meta.Set("mqtt_topic", string(msg.Topic()))
 		meta.Set("mqtt_message_id", strconv.Itoa(int(msg.MessageID())))
 
-		return message, noopAsyncAckFn, nil
+		return message, func(ctx context.Context, res types.Response) error {
+			if res.Error() == nil {
+				msg.Ack()
+			}
+			return nil
+		}, nil
 	case <-ctx.Done():
 	case <-m.interruptChan:
 		return nil, nil, types.ErrTypeClosed
