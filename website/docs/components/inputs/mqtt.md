@@ -52,6 +52,7 @@ input:
     clean_session: true
     user: ""
     password: ""
+    stale_connection_timeout: ""
 ```
 
 </TabItem>
@@ -126,6 +127,14 @@ Default: `""`
 ### `password`
 
 A password to provide for the connection.
+
+
+Type: `string`  
+Default: `""`  
+
+### `stale_connection_timeout`
+
+An optional duration whereby if no message has been received the connection is assumed stale and will be re-established.
 
 
 Type: `string`  
