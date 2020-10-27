@@ -1,6 +1,8 @@
 package processor
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/Jeffail/benthos/v3/lib/metrics"
 	"github.com/Jeffail/benthos/v3/lib/types"
 	"github.com/Jeffail/benthos/v3/lib/x/docs"
+	schemaregistry "github.com/Landoop/schema-registry"
 	"github.com/linkedin/goavro/v2"
 	"github.com/opentracing/opentracing-go"
 )
@@ -44,6 +47,11 @@ specified encoding.`,
 			docs.FieldCommon("encoding", "An Avro encoding format to use for conversions to and from a schema.").HasOptions("textual", "binary", "single"),
 			docs.FieldCommon("schema", "A full Avro schema to use."),
 			docs.FieldCommon("schema_path", "The path of a schema document to apply. Use either this or the `schema` field."),
+			docs.FieldCommon(
+				"schema_registry_url", "The path of a schema document to apply. Use either this or the `schema` field.",
+				"http://localhost:8081",
+			),
+			docs.FieldCommon("topic", "The name of topic to find schema on registry"),
 			partsFieldSpec,
 		},
 	}
@@ -53,21 +61,25 @@ specified encoding.`,
 
 // AvroConfig contains configuration fields for the Avro processor.
 type AvroConfig struct {
-	Parts      []int  `json:"parts" yaml:"parts"`
-	Operator   string `json:"operator" yaml:"operator"`
-	Encoding   string `json:"encoding" yaml:"encoding"`
-	Schema     string `json:"schema" yaml:"schema"`
-	SchemaPath string `json:"schema_path" yaml:"schema_path"`
+	Parts             []int  `json:"parts" yaml:"parts"`
+	Operator          string `json:"operator" yaml:"operator"`
+	Encoding          string `json:"encoding" yaml:"encoding"`
+	Schema            string `json:"schema" yaml:"schema"`
+	SchemaPath        string `json:"schema_path" yaml:"schema_path"`
+	SchemaRegistryUrl string `json:"schema_registry_url" yaml:"schema_registry_url" default:"http://localhost:8081"`
+	Topic             string `json:"topic" yaml:"topic"`
 }
 
 // NewAvroConfig returns a AvroConfig with default values.
 func NewAvroConfig() AvroConfig {
 	return AvroConfig{
-		Parts:      []int{},
-		Operator:   "to_json",
-		Encoding:   "textual",
-		Schema:     "",
-		SchemaPath: "",
+		Parts:             []int{},
+		Operator:          "to_json",
+		Encoding:          "textual",
+		Schema:            "",
+		SchemaPath:        "",
+		SchemaRegistryUrl: "http://localhost:8081",
+		Topic:             "",
 	}
 }
 
@@ -114,7 +126,7 @@ func newAvroToJSONOperator(encoding string, codec *goavro.Codec) (avroOperator, 
 	return nil, fmt.Errorf("encoding '%v' not recognised", encoding)
 }
 
-func newAvroFromJSONOperator(encoding string, codec *goavro.Codec) (avroOperator, error) {
+func newAvroFromJSONOperator(encoding string, codec *goavro.Codec, schemaID int) (avroOperator, error) {
 	switch encoding {
 	case "textual":
 		return func(part types.Part) error {
@@ -155,16 +167,38 @@ func newAvroFromJSONOperator(encoding string, codec *goavro.Codec) (avroOperator
 			part.Set(single)
 			return nil
 		}, nil
+	case "confluent":
+		return func(part types.Part) error {
+			jObj, err := part.JSON()
+			if err != nil {
+				return fmt.Errorf("failed to parse message as JSON: %v", err)
+			}
+			value, _ := json.Marshal(jObj)
+			schemaIDBytes := make([]byte, 4)
+			binary.BigEndian.PutUint32(schemaIDBytes, uint32(schemaID))
+
+			native, _, _ := codec.NativeFromTextual(value)
+			valueBytes, err := codec.BinaryFromNative(nil, native)
+			if err != nil {
+				return fmt.Errorf("failed to convert JSON to Avro Confluent: %v", err)
+			}
+			var recordValue []byte
+			recordValue = append(recordValue, byte(0))
+			recordValue = append(recordValue, schemaIDBytes...)
+			recordValue = append(recordValue, valueBytes...)
+			part.Set(recordValue)
+			return nil
+		}, nil
 	}
 	return nil, fmt.Errorf("encoding '%v' not recognised", encoding)
 }
 
-func strToAvroOperator(opStr, encoding string, codec *goavro.Codec) (avroOperator, error) {
+func strToAvroOperator(opStr, encoding string, codec *goavro.Codec, schemaID int) (avroOperator, error) {
 	switch opStr {
 	case "to_json":
 		return newAvroToJSONOperator(encoding, codec)
 	case "from_json":
-		return newAvroFromJSONOperator(encoding, codec)
+		return newAvroFromJSONOperator(encoding, codec, schemaID)
 	}
 	return nil, fmt.Errorf("operator not recognised: %v", opStr)
 }
@@ -225,6 +259,7 @@ func NewAvro(
 	}
 	var schema string
 	var err error
+	var schemaID int
 
 	if schemaPath := conf.Avro.SchemaPath; schemaPath != "" {
 		if !(strings.HasPrefix(schemaPath, "file://") || strings.HasPrefix(schemaPath, "http://")) {
@@ -239,12 +274,35 @@ func NewAvro(
 		schema = conf.Avro.Schema
 	}
 
+	if schemaRegistryUrl := conf.Avro.SchemaRegistryUrl; schemaRegistryUrl != "" {
+		schemaRegistryClient, err := schemaregistry.NewClient(conf.Avro.SchemaRegistryUrl)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect schema registry: %v", err)
+		}
+
+		schemaObj, err := schemaRegistryClient.GetLatestSchema(conf.Avro.Topic)
+		schemaID = schemaObj.ID
+
+		if schemaID <= 0 {
+			if schema != "" {
+				schemaID, err = schemaRegistryClient.RegisterNewSchema(conf.Avro.Topic, schema)
+				if err != nil {
+					panic(fmt.Sprintf("Error creating the schema %s", err))
+				}
+			} else {
+				return nil, fmt.Errorf("invalid schema provided or empty schema!!")
+			}
+		} else {
+			schema = schemaObj.Schema
+		}
+	}
+
 	codec, err := goavro.NewCodec(schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse schema: %v", err)
 	}
 
-	if a.operator, err = strToAvroOperator(conf.Avro.Operator, conf.Avro.Encoding, codec); err != nil {
+	if a.operator, err = strToAvroOperator(conf.Avro.Operator, conf.Avro.Encoding, codec, schemaID); err != nil {
 		return nil, err
 	}
 	return a, nil
